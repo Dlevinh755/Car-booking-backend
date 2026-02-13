@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: mydatabase
+      MYSQL_USER: my_user
+      MYSQL_PASSWORD: my_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost", "-uroot", "-proot_password"]
+      interval: 10s   # Kiểm tra mỗi 10 giây
+      timeout: 5s     # Quá 5 giây không phản hồi coi như lỗi
+      retries: 5      # Thử lại 5 lần trước khi báo Unhealthy
+    networks:
+      - cab_network
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: phpmyadmin_gui
+    restart: always
+    ports:
+      - "8080:80"
+    environment:
+      PMA_HOST: db
+      PMA_USER: root
+      PMA_PASSWORD: root_password
+    depends_on:
+      - db
+    networks:
+      - cab_network
+
+  payment-service:
+    build:
+      context: ./services/payment-service
+      dockerfile: Dockerfile
+    container_name: payment-service
+    restart: always
+    env_file:
+      - ./services/payment-service/.env 
+    ports:
+      - "8088:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - cab_network
+    
+volumes:
+  mysql_data:
+
+networks:
+  cab_network:
+    driver: bridge
