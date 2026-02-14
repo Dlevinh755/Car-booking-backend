@@ -1,36 +1,43 @@
-# Stage 1: Build bước trung gian
-FROM node:20-alpine AS build
+# Multi-stage build for Payment Service
+FROM node:18-alpine AS builder
 
-# Tạo thư mục làm việc
+# Set working directory
 WORKDIR /app
 
-# Chỉ copy file package trước để tận dụng Docker Cache (giúp build nhanh hơn)
+# Copy package files
 COPY package*.json ./
 
-# Cài đặt dependencies
-RUN npm install
+# Install dependencies
+RUN npm install --production
 
-# Copy toàn bộ code còn lại
-COPY . .
+# Production stage
+FROM node:18-alpine
 
-# Nếu bạn dùng TypeScript hoặc cần build (Next.js, NestJS), hãy chạy lệnh build
-# RUN npm run build
-
-# Stage 2: Runner - Stage cuối cùng để chạy ứng dụng
-FROM node:20-alpine AS runner
-
+# Set working directory
 WORKDIR /app
 
-# Chỉ copy những thứ cần thiết từ stage build
-COPY --from=build /app/package*.json ./
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/. . 
+# Copy dependencies from builder
+COPY --from=builder /app/node_modules ./node_modules
 
-# Thiết lập biến môi trường
-ENV NODE_ENV=production
+# Copy application code
+COPY . .
 
-# Mở port cho ứng dụng
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# Change ownership
+RUN chown -R nodejs:nodejs /app
+
+# Switch to non-root user
+USER nodejs
+
+# Expose port
 EXPOSE 3000
 
-# Chạy ứng dụng
-CMD ["npm", "start"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3000/order', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+# Start application
+CMD ["node", "./bin/www"]

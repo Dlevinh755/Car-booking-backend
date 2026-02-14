@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: mysql:8.0
@@ -47,10 +45,148 @@ services:
     env_file:
       - ./services/payment-service/.env 
     ports:
-      - "8088:3000"
+      - "3006:3000"
+    environment:
+      PORT: 3000
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      - cab_network
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: auth-service
+    restart: always
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+    networks:
+      - cab_network
+
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: user-service
+    restart: always
+    ports:
+      - "3002:3002"
+    environment:
+      PORT: 3002
+    networks:
+      - cab_network
+
+  booking-service:
+    build:
+      context: ./services/booking-service
+      dockerfile: Dockerfile
+    container_name: booking-service
+    restart: always
+    ports:
+      - "3003:3003"
+    environment:
+      PORT: 3003
+    networks:
+      - cab_network
+
+  ride-service:
+    build:
+      context: ./services/ride-service
+      dockerfile: Dockerfile
+    container_name: ride-service
+    restart: always
+    ports:
+      - "3004:3004"
+    environment:
+      PORT: 3004
+    networks:
+      - cab_network
+
+  driver-service:
+    build:
+      context: ./services/driver-service
+      dockerfile: Dockerfile
+    container_name: driver-service
+    restart: always
+    ports:
+      - "3005:3005"
+    environment:
+      PORT: 3005
+    networks:
+      - cab_network
+
+  pricing-service:
+    build:
+      context: ./services/pricing-service
+      dockerfile: Dockerfile
+    container_name: pricing-service
+    restart: always
+    ports:
+      - "3007:3007"
+    environment:
+      PORT: 3007
+    networks:
+      - cab_network
+
+  review-service:
+    build:
+      context: ./services/review-service
+      dockerfile: Dockerfile
+    container_name: review-service
+    restart: always
+    ports:
+      - "3008:3008"
+    environment:
+      PORT: 3008
+    networks:
+      - cab_network
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    restart: always
+    ports:
+      - "3009:3009"
+    environment:
+      PORT: 3009
+    networks:
+      - cab_network
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      AUTH_SERVICE_URL: http://auth-service:3001
+      USER_SERVICE_URL: http://user-service:3002
+      BOOKING_SERVICE_URL: http://booking-service:3003
+      RIDE_SERVICE_URL: http://ride-service:3004
+      DRIVER_SERVICE_URL: http://driver-service:3005
+      PAYMENT_SERVICE_URL: http://payment-service:3000
+      PRICING_SERVICE_URL: http://pricing-service:3007
+      REVIEW_SERVICE_URL: http://review-service:3008
+      NOTIFICATION_SERVICE_URL: http://notification-service:3009
+    depends_on:
+      - auth-service
+      - user-service
+      - booking-service
+      - ride-service
+      - driver-service
+      - payment-service
+      - pricing-service
+      - review-service
+      - notification-service
     networks:
       - cab_network
     
