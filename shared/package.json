@@ -1,0 +1,11 @@
+{
+  "name": "car-booking-shared",
+  "version": "1.0.0",
+  "description": "Shared utilities for car booking microservices",
+  "main": "config.js",
+  "dependencies": {
+    "mysql2": "^3.6.0",
+    "uuid": "^9.0.0",
+    "axios": "^1.6.0"
+  }
+}

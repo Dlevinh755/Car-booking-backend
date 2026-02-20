@@ -4,11 +4,15 @@ FROM node:18-alpine AS builder
 # Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy package files for service
+COPY services/auth-service/package*.json ./
 
-# Install dependencies
-RUN npm install --production
+# Copy shared package.json
+COPY shared/package.json /shared/package.json
+
+# Install dependencies for both service and shared
+RUN npm install --production && \
+    cd /shared && npm install --production
 
 # Production stage
 FROM node:18-alpine
@@ -19,15 +23,20 @@ WORKDIR /app
 # Copy dependencies from builder
 COPY --from=builder /app/node_modules ./node_modules
 
+# Copy shared folder and its dependencies
+COPY --from=builder /shared/node_modules /shared/node_modules
+COPY shared /shared
+
 # Copy application code
-COPY . .
+COPY services/auth-service .
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
 
 # Change ownership
-RUN chown -R nodejs:nodejs /app
+RUN chown -R nodejs:nodejs /app && \
+    chown -R nodejs:nodejs /shared
 
 # Switch to non-root user
 USER nodejs

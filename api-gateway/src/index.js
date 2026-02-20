@@ -34,9 +34,8 @@ const proxyOptions = (target) => ({
   target,
   changeOrigin: true,
   pathRewrite: (path, req) => {
-    // Remove the service prefix from the path
-    const serviceName = path.split('/')[2];
-    return path.replace(`/api/${serviceName}`, '');
+    // Remove /api prefix only, keep the service name in the path
+    return path.replace('/api', '');
   },
   onError: (err, req, res) => {
     console.error(`Proxy error for ${target}:`, err.message);

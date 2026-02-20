@@ -1,49 +1,48 @@
-var express = require('express');
-var path = require('path');
-var favicon = require('serve-favicon');
-var logger = require('morgan');
-var cookieParser = require('cookie-parser');
-var bodyParser = require('body-parser');
-var order = require('./routes/order');
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+const db = require('../../shared/db');
+const routes = require('./routes');
+const errorHandler = require('./middlewares/errorHandler');
+const requestIdMiddleware = require('./middlewares/requestId');
 
-var app = express();
-const cors = require("cors");
-app.use(cors({ origin: "http://localhost:5173" })); // nếu React chạy 3000
+const app = express();
+const PORT = process.env.PORT || 3006;
+
+// Middleware
+app.use(cors());
+app.use(morgan('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(requestIdMiddleware);
 
-
-
-// view engine setup
-app.set('views', path.join(__dirname, 'views'));
-app.set('view engine', 'jade');
-
-// uncomment after placing your favicon in /public
-//app.use(favicon(path.join(__dirname, 'public', 'favicon.ico')));
-app.use(logger('dev'));
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(cookieParser());
-app.use(express.static(path.join(__dirname, 'public')));
-
-app.use('/order', order);
-
-// catch 404 and forward to error handler
-app.use(function(req, res, next) {
-  var err = new Error('Not Found');
-  err.status = 404;
-  next(err);
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'Payment Service is running', 
+    timestamp: new Date().toISOString(),
+    service: 'payment-service'
+  });
 });
 
-// error handler
-app.use(function(err, req, res, next) {
-  // set locals, only providing error in development
-  res.locals.message = err.message;
-  res.locals.error = req.app.get('env') === 'development' ? err : {};
+// Routes
+app.use('/', routes);
 
-  // render the error page
-  res.status(err.status || 500);
-  res.render('error');
-});
+// Error handler
+app.use(errorHandler);
+
+// Initialize database when app is required
+const initDB = async () => {
+  try {
+    await db.initPool();
+    console.log('✓ Database connection pool initialized');
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    process.exit(1);
+  }
+};
+
+initDB();
 
 module.exports = app;
+
