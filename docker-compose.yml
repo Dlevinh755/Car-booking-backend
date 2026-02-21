@@ -1,42 +1,61 @@
-version: '3.8'
-
+version: "3.9"
 services:
-  db:
-    image: mysql:8.0
-    container_name: mysql_db
-    restart: always
+  postgres:
+    image: postgres:16-alpine
+    container_name: taxi_postgres
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: root_password
-      MYSQL_DATABASE: mydatabase
-      MYSQL_USER: my_user
-      MYSQL_PASSWORD: my_password
+      POSTGRES_USER: taxi
+      POSTGRES_PASSWORD: taxi_pass
+      POSTGRES_DB: taxi_main
+      TZ: Asia/Ho_Chi_Minh
     ports:
-      - "3306:3306"
+      - "5432:5432"
     volumes:
-      - mysql_data:/var/lib/mysql
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost", "-uroot", "-proot_password"]
-      interval: 10s   # Kiểm tra mỗi 10 giây
-      timeout: 5s     # Quá 5 giây không phản hồi coi như lỗi
-      retries: 5      # Thử lại 5 lần trước khi báo Unhealthy
+      test: ["CMD-SHELL", "pg_isready -U taxi -d taxi_main"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     networks:
-      - cab_network
+      - taxi_net
 
-  phpmyadmin:
-    image: phpmyadmin:latest
-    container_name: phpmyadmin_gui
-    restart: always
-    ports:
-      - "8080:80"
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: taxi_pgadmin
+    restart: unless-stopped
     environment:
-      PMA_HOST: db
-      PMA_USER: root
-      PMA_PASSWORD: root_password
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "5050:80"
     depends_on:
-      - db
+      postgres:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     networks:
-      - cab_network
+      - taxi_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: taxi_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - taxi_net
 
   payment-service:
     build:
@@ -49,14 +68,39 @@ services:
     ports:
       - "8088:3000"
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
     networks:
-      - cab_network
+      - taxi_net
+    
+  pricing-service:
+    build:
+      context: ./services/pricing-service
+      dockerfile: Dockerfile
+    container_name: taxi_pricing
+    restart: unless-stopped
+    environment:
+      PORT: 8002
+      OSRM_BASE_URL: https://router.project-osrm.org
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - taxi_net
     
 volumes:
-  mysql_data:
+  postgres_data:
+  pgadmin_data:
+  redis_data:
 
 networks:
-  cab_network:
+  taxi_net:
     driver: bridge

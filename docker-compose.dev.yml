@@ -1,0 +1,294 @@
+services:
+  pricing-service:
+    image: node:20-alpine
+    container_name: taxi_pricing_dev
+    working_dir: /app
+    environment:
+      PORT: 8002
+      OSRM_BASE_URL: https://router.project-osrm.org
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./services/pricing-service:/app
+      # giữ node_modules trong container để không bị override bởi volume
+      - pricing_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev"
+    networks:
+      - taxi_net
+  booking-service:
+    image: node:20-alpine
+    container_name: taxi_booking_dev
+    working_dir: /app
+    environment:
+      PORT: 8003
+      DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/taxi_main
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./services/booking-service:/app
+      - booking_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - taxi_net
+  booking-worker:
+    image: node:20-alpine
+    container_name: taxi_booking_worker_dev
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/taxi_main
+      OUTBOX_POLL_MS: 1000
+      OUTBOX_BATCH_SIZE: 20
+      TZ: Asia/Ho_Chi_Minh
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: taxi.events
+    volumes:
+      - ./services/booking-service:/app
+      - booking_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run worker"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - taxi_net
+  postgres:
+    image: postgres:16-alpine
+    container_name: taxi_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: taxi
+      POSTGRES_PASSWORD: taxi_pass
+      POSTGRES_DB: taxi_main
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taxi -d taxi_main"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - taxi_net
+  redis:
+    image: redis:7-alpine
+    container_name: taxi_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - taxi_net
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: taxi_kafka
+    restart: unless-stopped
+    ports:
+      - "9094:9094"  # host access
+    environment:
+      # KRaft combined mode (broker + controller trong 1 container)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+
+      # listeners: 1 cái cho container network, 1 cái cho host
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # dev settings (single node)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - taxi_net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: taxi_kafka_ui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: taxi-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      - kafka
+    networks:
+      - taxi_net
+
+  kafka-init:
+    image: apache/kafka:4.1.1
+    container_name: taxi_kafka_init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka to be ready..."
+        sleep 10
+        echo "Creating taxi.events topic..."
+        /opt/kafka/bin/kafka-topics.sh --create \
+          --bootstrap-server kafka:9092 \
+          --topic taxi.events \
+          --partitions 3 \
+          --replication-factor 1 \
+          --if-not-exists
+        echo "Topic created successfully!"
+        /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - taxi_net
+    restart: "no"
+
+  ride-service:
+    image: node:20-alpine
+    container_name: taxi_ride_dev
+    working_dir: /app
+    ports:
+      - "8005:8005"
+    environment:
+      PORT: 8005
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: taxi.events
+      KAFKA_GROUP_ID: ride-service
+      TZ: Asia/Ho_Chi_Minh
+      DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/ride_db
+      DRIVER_BASE_URL: http://driver-service:8004
+      REDIS_URL: redis://redis:6379
+      OFFER_TIMEOUT_SEC: 10
+    volumes:
+      - ./services/ride-service:/app
+      - ride_node_modules:/app/node_modules
+    command: sh -c "npm install && node index.js"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - taxi_net
+
+  driver-service:
+    image: node:20-alpine
+    container_name: taxi_driver_dev
+    working_dir: /app
+    environment:
+      PORT: 8004
+      REDIS_URL: redis://redis:6379
+      HB_TTL_SEC: 60
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./services/driver-service:/app
+      - driver_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - taxi_net
+  booking-consumer:
+    image: node:20-alpine
+    container_name: taxi_booking_consumer
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/taxi_main
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: taxi.events
+      KAFKA_GROUP_ID: booking-service
+    volumes:
+      - ./services/booking-service:/app
+      - booking_node_modules:/app/node_modules
+    command: sh -c "npm install && node consumer.js"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - taxi_net
+  driver-client:
+    image: node:20-alpine
+    container_name: taxi_driver_client_d1
+    working_dir: /app
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: taxi.events
+      KAFKA_GROUP_ID: driver-client
+      DRIVER_ID: d1
+      RIDE_BASE_URL: http://ride-service:8005
+    volumes:
+      - ./services/driver-client:/app
+      - driver_client_node_modules:/app/node_modules
+    command: sh -c "npm install kafkajs axios && node index.js"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - taxi_net
+  notification-service:
+    image: node:20-alpine
+    container_name: taxi_notification_dev
+    working_dir: /app
+    environment:
+      PORT: 8006
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: taxi.events
+      KAFKA_GROUP_ID: notification-service
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "8006:8006"
+    volumes:
+      - ./services/notification-service:/app
+      - notification_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - taxi_net
+
+
+networks:
+  taxi_net:
+    driver: bridge
+volumes:
+  postgres_data:
+  redis_data:
+  pricing_node_modules:
+  booking_node_modules:
+  ride_node_modules:
+  driver_node_modules:
+  driver_client_node_modules:
+  notification_node_modules:

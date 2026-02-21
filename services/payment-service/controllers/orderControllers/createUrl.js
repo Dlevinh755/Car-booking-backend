@@ -3,7 +3,7 @@ const config = require('config');
 const querystring = require('qs');
 const crypto = require("crypto");
 const dotenv = require('dotenv');
-const db = require('../../config/database');
+//const db = require('../../config/database');
 dotenv.config();
 
 // Hàm phụ trợ sortObject
@@ -94,7 +94,7 @@ exports.createPaymentUrl = async (req, res, next) => {
 
     try {
         // GỌI HÀM LƯU VÀO DB TRƯỚC KHI TRẢ VỀ URL
-        await createOrder(orderId, 'pending', amount);
+    //    await createOrder(orderId, 'pending', amount);
         
         // Trả kết quả về cho Client
         res.status(200).json({ 

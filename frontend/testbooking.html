@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Taxi MVP - Dashboard Điều Phối</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 1000px; margin: 24px auto; padding: 0 16px; background-color: #f4f7f6; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+    .card { background: white; border-radius: 12px; padding: 20px; margin-top: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    h3 { margin-top: 0; color: #333; border-bottom: 2px solid #eee; padding-bottom: 8px; }
+    input, select, button { padding: 10px; border-radius: 8px; border: 1px solid #ccc; font-size: 14px; }
+    button { background-color: #007bff; color: white; border: none; transition: 0.2s; }
+    button:hover { background-color: #0056b3; }
+    button:disabled { background-color: #ccc; cursor: not-allowed; }
+    .muted { color: #666; font-size: 13px; }
+    .ok { color: #28a745; font-weight: bold; }
+    .warn { color: #fd7e14; font-weight: bold; }
+    .err { color: #dc3545; font-weight: bold; }
+    .info { color: #17a2b8; font-weight: bold; }
+    pre { background: #272822; color: #f8f8f2; padding: 12px; border-radius: 8px; overflow: auto; max-height: 200px; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    #notification-area { border-left: 4px solid #007bff; background: #e7f3ff; padding: 10px; margin-top: 10px; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h1>🚕 Taxi MVP - Test Booking System</h1>
+
+  <div class="card">
+    <h3>1. Cấu hình hệ thống</h3>
+    <div class="row">
+      <div>
+        <label class="muted">Pricing API</label><br>
+        <input id="pricingBase" style="width:200px;" value="http://localhost:8002" />
+      </div>
+      <div>
+        <label class="muted">Booking API</label><br>
+        <input id="bookingBase" style="width:200px;" value="http://localhost:8003" />
+      </div>
+      <div>
+        <label class="muted">Notify (SSE) API</label><br>
+        <input id="notifyBase" style="width:200px;" value="http://localhost:8006" />
+      </div>
+      <div>
+        <label class="muted">User ID (Để nhận SSE)</label><br>
+        <input id="userId" style="width:120px;" value="u1" />
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>2. Vị trí đặt xe</h3>
+      <div class="row">
+        <strong>Pickup:</strong>
+        <input id="pLat" type="number" step="0.000001" style="width:90px;" value="10.762622" />
+        <input id="pLng" type="number" step="0.000001" style="width:90px;" value="106.660172" />
+        <button id="btnGeo" style="background:#6c757d">📍</button>
+      </div>
+      <div class="row">
+        <strong>Dropoff:</strong>
+        <input id="dLat" type="number" step="0.000001" style="width:90px;" value="10.762" />
+        <input id="dLng" type="number" step="0.000001" style="width:90px;" value="106.682" />
+      </div>
+      <div class="row">
+        <label>Loại xe:</label>
+        <select id="vehicleType">
+          <option value="CAR_4">Xe 4 chỗ</option>
+          <option value="CAR_7">Xe 7 chỗ</option>
+        </select>
+        <label>Thanh toán:</label>
+        <select id="paymentMethod">
+          <option value="CASH">Tiền mặt</option>
+          <option value="VNPAY">VNPAY</option>
+        </select>
+      </div>
+      <hr>
+      <div class="row">
+        <button id="btnEstimate">Bước 1: Tính giá</button>
+        <button id="btnCreate" disabled style="background:#28a745">Bước 2: Đặt xe ngay</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>3. Trạng thái thời gian thực (SSE)</h3>
+      <div id="notification-area">
+        <strong>📡 Thông báo:</strong> <span id="notifyMsg">Chưa kết nối SSE</span>
+      </div>
+      <p>Booking ID: <span id="bookingId" class="ok">-</span></p>
+      <p>Trạng thái: <span id="bookingStatus" class="warn">N/A</span></p>
+      <p>Driver ID: <span id="driverId" class="info">-</span></p>
+      <div class="row">
+        <button id="btnPoll" disabled style="background:#17a2b8">Bật Polling</button>
+        <button id="btnStop" disabled style="background:#dc3545">Dừng Poll</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Kết quả Estimate</h3>
+      <div id="estimateLine" class="info">Chưa có dữ liệu</div>
+      <pre id="estimateJson">{}</pre>
+    </div>
+    <div class="card">
+      <h3>Nhật ký hệ thống (Logs)</h3>
+      <pre id="logs" style="height: 150px; background: #000;">[SYSTEM] Ready...</pre>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let lastEstimate = null;
+    let currentBookingId = null;
+    let pollTimer = null;
+    let eventSource = null;
+
+    function log(msg, type = 'info') {
+      const ts = new Date().toLocaleTimeString();
+      const line = `[${ts}] ${msg}\n`;
+      $("logs").textContent = line + $("logs").textContent;
+      console.log(`[${type}] ${msg}`);
+    }
+
+    // --- SSE Logic ---
+    function startSSE(userId) {
+      if (eventSource) eventSource.close();
+      const url = `${$("notifyBase").value}/notifications/stream?role=USER&userId=${userId}`;
+      eventSource = new EventSource(url);
+
+      $("notification-area").style.display = "block";
+      $("notifyMsg").innerHTML = `<span class="info">Đang kết nối SSE cho User: ${userId}...</span>`;
+      log("Đang kết nối SSE cho User: " + userId);
+      
+      eventSource.onopen = () => {
+        $("notifyMsg").innerHTML = `<span class="ok">✅ Kết nối SSE thành công! Đang chờ thông báo...</span>`;
+        log("SSE: Kết nối thành công", "ok");
+      };
+
+      // Listen for booking events
+      eventSource.addEventListener("booking", (e) => {
+        const evt = JSON.parse(e.data);
+        const eventType = evt.eventType || "UNKNOWN";
+        log(`SSE: Booking event - ${eventType}`);
+        
+        if (eventType === "BOOKING_CREATED") {
+          $("notifyMsg").innerHTML = `<b class="ok">✅ Đơn đặt xe đã được tạo!</b>`;
+        } else if (eventType === "BOOKING_MATCH_REQUESTED") {
+          $("notifyMsg").innerHTML = `<b class="info">🔍 Đang tìm tài xế gần bạn...</b>`;
+        }
+      });
+
+      // Ride accepted by driver
+      eventSource.addEventListener("ride_accepted", (e) => {
+        const evt = JSON.parse(e.data);
+        const driverId = evt.payload?.driverId || "N/A";
+        $("driverId").textContent = driverId;
+        $("bookingStatus").textContent = "DRIVER_ASSIGNED";
+        $("notifyMsg").innerHTML = `<b class="ok">🚗 Tài xế ${driverId} đã nhận chuyến!</b>`;
+        log(`SSE: Tài xế ${driverId} nhận chuyến`, "ok");
+      });
+
+      // Ride completed
+      eventSource.addEventListener("ride_completed", (e) => {
+        $("bookingStatus").textContent = "COMPLETED";
+        $("notifyMsg").innerHTML = `<b class="info">🏁 Chuyến đi hoàn thành!</b>`;
+        log("SSE: Chuyến đi hoàn thành", "ok");
+        stopPoll();
+      });
+
+      // SSE errors
+      eventSource.onerror = (err) => {
+        $("notifyMsg").innerHTML = `<span class="err">❌ Lỗi kết nối SSE</span>`;
+        log("SSE Connection Error", "err");
+        console.error("SSE Error:", err);
+      };
+
+      // Heartbeat ping (optional - just for logging)
+      eventSource.addEventListener("ping", () => {
+        console.log("SSE: Heartbeat ping");
+      });
+    }
+
+    // --- Core Logic ---
+    $("btnEstimate").onclick = async () => {
+      const pricingBase = $("pricingBase").value;
+      const body = {
+        pickup: { lat: Number($("pLat").value), lng: Number($("pLng").value) },
+        dropoff: { lat: Number($("dLat").value), lng: Number($("dLng").value) },
+        vehicleType: $("vehicleType").value
+      };
+
+      try {
+        const res = await fetch(`${pricingBase}/pricing/estimate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Lỗi estimate");
+
+        lastEstimate = data;
+        $("estimateJson").textContent = JSON.stringify(data, null, 2);
+        $("estimateLine").textContent = `${(data.distanceM/1000).toFixed(2)}km - ${Math.round(data.durationS/60)} phút - ${Number(data.fare).toLocaleString()} ${data.currency}`;
+        $("btnCreate").disabled = false;
+        log("Estimate thành công");
+      } catch (e) {
+        log(e.message, "err");
+      }
+    };
+
+    $("btnCreate").onclick = async () => {
+      const bookingBase = $("bookingBase").value;
+      const userId = $("userId").value;
+      
+      const body = {
+        userId: userId,
+        pickup: { lat: Number($("pLat").value), lng: Number($("pLng").value) },
+        dropoff: { lat: Number($("dLat").value), lng: Number($("dLng").value) },
+        vehicleType: $("vehicleType").value,
+        paymentMethod: $("paymentMethod").value,
+        pricingSnapshot: lastEstimate
+      };
+
+      try {
+        const res = await fetch(`${bookingBase}/bookings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Lỗi tạo booking");
+
+        currentBookingId = data.bookingId;
+        $("bookingId").textContent = currentBookingId;
+        $("bookingStatus").textContent = data.status;
+        $("btnPoll").disabled = false;
+        
+        log("Booking thành công: " + currentBookingId);
+        startSSE(userId); // Tự động bật thông báo real-time
+      } catch (e) {
+        log(e.message, "err");
+      }
+    };
+
+    async function checkStatus() {
+      if (!currentBookingId) return;
+      try {
+        const res = await fetch(`${$("bookingBase").value}/bookings/${currentBookingId}`);
+        const data = await res.json();
+        $("bookingStatus").textContent = data.status;
+        log("Polling status: " + data.status);
+        if (data.status === "COMPLETED" || data.status === "CANCELLED") stopPoll();
+      } catch (e) { log("Poll error", "err"); }
+    }
+
+    $("btnPoll").onclick = () => {
+      checkStatus();
+      pollTimer = setInterval(checkStatus, 3000);
+      $("btnPoll").disabled = true;
+      $("btnStop").disabled = false;
+      log("Bắt đầu Polling...");
+    };
+
+    function stopPoll() {
+      clearInterval(pollTimer);
+      $("btnPoll").disabled = false;
+      $("btnStop").disabled = true;
+      log("Dừng Polling.");
+    }
+
+    $("btnStop").onclick = stopPoll;
+    
+    // Geolocation
+    $("btnGeo").onclick = () => {
+      navigator.geolocation.getCurrentPosition(pos => {
+        $("pLat").value = pos.coords.latitude.toFixed(6);
+        $("pLng").value = pos.coords.longitude.toFixed(6);
+      });
+    };
+  </script>
+</body>
+</html>

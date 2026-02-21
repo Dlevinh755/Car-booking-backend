@@ -1,7 +1,7 @@
 const config = require('config');
 const crypto = require("crypto");
 const qs = require('qs');
-const db = require('../../config/database'); // Import kết nối DB của bạn
+//const db = require('../../config/database'); // Import kết nối DB của bạn
 
 function sortObject(obj) {
     let sorted = {};
@@ -51,12 +51,12 @@ const vnpayIpn = async (req, res, next) => {
                     if (order.status === 'pending') {
                         if (rspCode == "00") {
                             // Thành công: Cập nhật status sang 'success'
-                            await db.query('UPDATE Orders SET status = ? WHERE orderID = ?', ['success', orderId]);
+                            //await db.query('UPDATE Orders SET status = ? WHERE orderID = ?', ['success', orderId]);
                             console.log(`--- Đơn hàng ${orderId} đã được cập nhật thành công ---`);
                             res.status(200).json({ RspCode: '00', Message: 'Success' });
                         } else {
                             // Thất bại: Cập nhật status sang 'fail'
-                            await db.query('UPDATE Orders SET status = ? WHERE orderID = ?', ['fail', orderId]);
+                            //await db.query('UPDATE Orders SET status = ? WHERE orderID = ?', ['fail', orderId]);
                             console.log(`--- Đơn hàng ${orderId} đã được cập nhật thành công ---`); 
                             res.status(200).json({ RspCode: '00', Message: 'Success' });
                         }
