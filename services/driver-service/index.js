@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "redis";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -11,7 +12,9 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 8004);
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
-const HB_TTL_SEC = Number(process.env.HB_TTL_SEC || 60);
+const HB_TTL_SEC = Number(process.env.HB_TTL_SEC || 1800); // 30 phút
+const STATE_TTL_SEC = Number(process.env.STATE_TTL_SEC || 1800); // 30 phút
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production-please";
 
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (e) => console.error("Redis error:", e.message));
@@ -33,11 +36,54 @@ const hbKey = (driverId) => `driver:hb:${driverId}`;
 const stateKey = (driverId) => `driver:state:${driverId}`;
 const vehicleKey = (driverId) => `driver:vehicle:${driverId}`;
 
-// MVP auth: lấy driverId từ header (sau thay JWT)
+// Auth middleware: support both JWT and legacy x-driver-id
+function authMiddleware(req, res, next) {
+  try {
+    // Try JWT first
+    const authHeader = req.header("Authorization");
+    console.log("🔐 Auth header:", authHeader ? "Bearer ***" : "missing");
+    
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const token = authHeader.substring(7);
+      const decoded = jwt.verify(token, JWT_SECRET);
+      console.log("✅ JWT decoded:", { role: decoded.role, driverId: decoded.driverId, sub: decoded.sub });
+      
+      if (decoded.role !== "DRIVER") {
+        return res.status(403).json({ error: "Forbidden: DRIVER role required" });
+      }
+      
+      req.auth = {
+        accountId: decoded.sub,
+        role: decoded.role,
+        driverId: decoded.driverId,
+      };
+      return next();
+    }
+    
+    // Fallback to legacy x-driver-id (for backward compatibility)
+    const legacyId = req.header("x-driver-id");
+    if (legacyId) {
+      console.log("📝 Using legacy x-driver-id:", legacyId);
+      req.auth = { driverId: legacyId, role: "DRIVER", accountId: null };
+      return next();
+    }
+    
+    return res.status(401).json({ error: "Missing authentication (Bearer token or x-driver-id)" });
+  } catch (err) {
+    console.error("❌ Auth error:", err.message);
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expired" });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 function getDriverId(req) {
-  const id = req.header("x-driver-id");
-  if (!id) throw new Error("Missing x-driver-id header (MVP)");
-  return id;
+  if (!req.auth?.driverId) throw new Error("Missing driverId");
+  return req.auth.driverId;
 }
 
 // Health
@@ -50,11 +96,51 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// --- 1) Set status ONLINE/OFFLINE ---
-app.post("/drivers/me/status", async (req, res) => {
+// --- GET current driver state (auto-restore on dashboard load) ---
+app.get("/drivers/me", authMiddleware, async (req, res) => {
   try {
     const driverId = getDriverId(req);
-    const { status, vehicleType } = req.body || {};
+    
+    const [status, vehicleType, hb] = await Promise.all([
+      redis.get(stateKey(driverId)),
+      redis.get(vehicleKey(driverId)),
+      redis.get(hbKey(driverId)),
+    ]);
+
+    let location = null;
+    if (vehicleType && (status === "ONLINE" || status === "BUSY")) {
+      // Try to get location from geo index
+      try {
+        const geoPos = await redis.geoPos(geoKey(vehicleType), driverId);
+        if (geoPos && geoPos[0]) {
+          location = {
+            lng: Number(geoPos[0].longitude),
+            lat: Number(geoPos[0].latitude),
+          };
+        }
+      } catch (err) {
+        // Geo position might not exist yet
+      }
+    }
+
+    res.json({
+      driverId,
+      status: status || "OFFLINE",
+      vehicleType: vehicleType || null,
+      location,
+      isActive: !!hb, // heartbeat exists = active in last 30min
+      ttlSec: STATE_TTL_SEC,
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// --- 1) Set status ONLINE/OFFLINE ---
+app.post("/drivers/me/status", authMiddleware, async (req, res) => {
+  try {
+    const driverId = getDriverId(req);
+    const { status, vehicleType, lat, lng } = req.body || {};
 
     if (!["ONLINE", "OFFLINE", "BUSY"].includes(status)) {
       throw new Error("status must be ONLINE|OFFLINE|BUSY");
@@ -80,17 +166,30 @@ app.post("/drivers/me/status", async (req, res) => {
       return res.json({ driverId, status: "OFFLINE" });
     }
 
-    // ONLINE/BUSY: set state + (tuỳ bạn) set TTL state theo heartbeat
-    await redis.set(stateKey(driverId), status);
-    // chưa có location thì chưa GEOADD; location endpoint sẽ add
-    res.json({ driverId, status, vehicleType: vt });
+    // If client provided lat/lng together with status, add to GEO index so
+    // the driver becomes immediately discoverable without a separate location call.
+    if (typeof lat === "number" && typeof lng === "number") {
+      try {
+        assertLatLng(lat, lng);
+        await redis.geoAdd(geoKey(vt), { longitude: lng, latitude: lat, member: driverId });
+        // also refresh heartbeat TTL when location provided
+        await redis.set(hbKey(driverId), "1", { EX: HB_TTL_SEC });
+      } catch (err) {
+        console.warn("Invalid lat/lng provided to /drivers/me/status:", err.message);
+      }
+    }
+
+    // ONLINE/BUSY: set state với TTL 30 phút
+    await redis.set(stateKey(driverId), status, { EX: STATE_TTL_SEC });
+    // If location not provided here, driver will be added to GEO when they POST /drivers/me/location
+    res.json({ driverId, status, vehicleType: vt, ttlSec: STATE_TTL_SEC });
   } catch (e) {
     res.status(400).json({ error: e.message });
   }
 });
 
 // --- 2) Update location (requires ONLINE/BUSY) ---
-app.post("/drivers/me/location", async (req, res) => {
+app.post("/drivers/me/location", authMiddleware, async (req, res) => {
   try {
     const driverId = getDriverId(req);
     const { lat, lng, accuracyM, ts } = req.body || {};

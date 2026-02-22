@@ -63,14 +63,44 @@ function calcFare(vehicleType, distanceM, durationS) {
   };
 }
 
+/**
+ * Haversine straight-line distance in metres.
+ * Multiply by road factor (~1.35 urban) for estimated route distance.
+ */
+function haversineM(a, b) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLng = Math.sin(dLng / 2);
+  const c = sinLat * sinLat + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * sinLng * sinLng;
+  return Math.round(2 * R * Math.asin(Math.sqrt(c)));
+}
+
+function estimateByHaversine(pickup, dropoff) {
+  const straight = haversineM(pickup, dropoff);
+  const distanceM = Math.round(straight * 1.35); // road factor
+  const speedMps = 30 / 3.6;                     // 30 km/h urban average
+  const durationS = Math.round(distanceM / speedMps);
+  return { distanceM, durationS, estimated: true };
+}
+
 app.post("/pricing/estimate", async (req, res) => {
   try {
     const { pickup, dropoff, vehicleType = "CAR_4" } = req.body || {};
     assertLatLng(pickup, "pickup");
     assertLatLng(dropoff, "dropoff");
 
-    // DEV: gọi OSRM public
-    const { distanceM, durationS } = await getRouteOSRM(pickup, dropoff);
+    let distanceM, durationS, routeSource;
+    try {
+      ({ distanceM, durationS } = await getRouteOSRM(pickup, dropoff));
+      routeSource = "osrm";
+    } catch (osrmErr) {
+      console.warn("[PRICING] OSRM failed, using Haversine fallback:", osrmErr.message);
+      ({ distanceM, durationS } = estimateByHaversine(pickup, dropoff));
+      routeSource = "haversine";
+    }
 
     const { fare, currency, breakdown } = calcFare(vehicleType, distanceM, durationS);
 
@@ -80,6 +110,7 @@ app.post("/pricing/estimate", async (req, res) => {
       fare,
       currency,
       breakdown,
+      routeSource,
     });
   } catch (e) {
     res.status(400).json({ error: e.message || "Bad Request" });

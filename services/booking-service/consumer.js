@@ -24,37 +24,75 @@ await consumer.run({
     if (!message.value) return;
     const evt = JSON.parse(message.value.toString());
 
-    if (evt.eventType !== "RIDE_ACCEPTED") return;
+    // ── RIDE_ACCEPTED: booking -> MATCHED ──────────────────────────────
+    if (evt.eventType === "RIDE_ACCEPTED") {
+      const { bookingId, rideId, driverId } = evt.payload || {};
+      if (!bookingId) return;
 
-    const { bookingId, rideId, driverId } = evt.payload;
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      // idempotent-ish: chỉ update nếu chưa DRIVER_ASSIGNED
-      const r = await client.query(
-        `UPDATE bookings
-         SET status='DRIVER_ASSIGNED', ride_id=$2, updated_at=now()
-         WHERE id=$1 AND status IN ('PAID','MATCHING')`,
-        [bookingId, rideId]
-      );
-
-      if (r.rowCount > 0) {
-        await client.query(
-          `INSERT INTO booking_status_history(id, booking_id, from_status, to_status, reason)
-           VALUES ($1,$2,$3,$4,$5)`,
-          [crypto.randomUUID(), bookingId, "PAID", "DRIVER_ASSIGNED", `driver=${driverId}`]
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const r = await client.query(
+          `UPDATE bookings
+           SET status='MATCHED', ride_id=$2, driver_id=$3, updated_at=now()
+           WHERE id=$1 AND status NOT IN ('COMPLETED','CANCELLED')`,
+          [bookingId, rideId, driverId]
         );
+        if (r.rowCount > 0) {
+          await client.query(
+            `INSERT INTO booking_status_history(id, booking_id, from_status, to_status, reason)
+             VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT DO NOTHING`,
+            [crypto.randomUUID(), bookingId, "PAID", "MATCHED", `driver=${driverId}`]
+          );
+        }
+        await client.query("COMMIT");
+        console.log(`[BOOKING] RIDE_ACCEPTED: booking=${bookingId} -> MATCHED ride=${rideId}`);
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        console.error("[BOOKING] RIDE_ACCEPTED error:", e.message);
+      } finally {
+        client.release();
       }
+      return;
+    }
 
-      await client.query("COMMIT");
-      console.log(`[BOOKING] updated booking=${bookingId} -> DRIVER_ASSIGNED ride=${rideId}`);
-    } catch (e) {
-      try { await client.query("ROLLBACK"); } catch {}
-      console.log("[BOOKING] consume error:", e.message);
-    } finally {
-      client.release();
+    // ── RIDE_COMPLETED: booking -> COMPLETED ───────────────────────────
+    if (evt.eventType === "RIDE_COMPLETED") {
+      const { rideId, bookingId } = evt.payload || {};
+      // Support lookup by bookingId (preferred) or rideId
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        let updated = 0;
+        if (bookingId) {
+          const r = await client.query(
+            `UPDATE bookings
+             SET status='COMPLETED', updated_at=now()
+             WHERE id=$1 AND status NOT IN ('COMPLETED','CANCELLED')`,
+            [bookingId]
+          );
+          updated = r.rowCount;
+        }
+        // Fallback: lookup by ride_id
+        if (!updated && rideId) {
+          const r = await client.query(
+            `UPDATE bookings
+             SET status='COMPLETED', updated_at=now()
+             WHERE ride_id=$1 AND status NOT IN ('COMPLETED','CANCELLED')`,
+            [rideId]
+          );
+          updated = r.rowCount;
+        }
+        await client.query("COMMIT");
+        console.log(`[BOOKING] RIDE_COMPLETED: ${updated} booking(s) -> COMPLETED (rideId=${rideId}, bookingId=${bookingId})`);
+      } catch (e) {
+        try { await client.query("ROLLBACK"); } catch {}
+        console.error("[BOOKING] RIDE_COMPLETED error:", e.message);
+      } finally {
+        client.release();
+      }
+      return;
     }
   }
 });

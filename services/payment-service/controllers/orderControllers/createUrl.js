@@ -3,7 +3,7 @@ const config = require('config');
 const querystring = require('qs');
 const crypto = require("crypto");
 const dotenv = require('dotenv');
-//const db = require('../../config/database');
+const pendingStore = require('../../pending-store');
 dotenv.config();
 
 // Hàm phụ trợ sortObject
@@ -61,6 +61,12 @@ exports.createPaymentUrl = async (req, res, next) => {
     let orderId = req.body.orderId || moment(date).format('DDHHmmss'); 
     let amount = req.body.amount;
     let bankCode = req.body.bankCode;
+    // Allow override from request body so callers can set their own return URL
+    if (req.body.returnUrl) returnUrl = req.body.returnUrl;
+
+    // Save userId so IPN handler can resolve it later
+    const userId = req.body.userId;
+    if (userId) pendingStore.save(orderId, userId, amount)
     
     let locale = req.body.language || 'vn';
     let currCode = 'VND';

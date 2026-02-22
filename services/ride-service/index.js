@@ -7,6 +7,7 @@ import axios from "axios";
 import express from "express";
 import cors from "cors";
 import { createClient } from "redis";
+import jwt from "jsonwebtoken";
 
 /**
  * ENV required (docker-compose):
@@ -18,6 +19,7 @@ import { createClient } from "redis";
  * - REDIS_URL=redis://redis:6379
  * - OFFER_TIMEOUT_SEC=10 (dev) or 60
  * - PORT=8005
+ * - JWT_SECRET=dev-secret-change-in-production-please
  */
 
 
@@ -26,9 +28,15 @@ const brokers = (process.env.KAFKA_BROKERS || "kafka:9092").split(",");
 const topic = process.env.KAFKA_TOPIC || "taxi.events";
 const groupId = process.env.KAFKA_GROUP_ID || "ride-service";
 const DRIVER_BASE_URL = process.env.DRIVER_BASE_URL || "http://driver-service:8004";
+const BOOKING_BASE_URL = process.env.BOOKING_BASE_URL || "http://booking-service:8003";
+const GEO_BASE_URL = process.env.GEO_BASE_URL || "http://geo-service:8007";
+const AUTH_BASE_URL = process.env.AUTH_BASE_URL || "http://auth-service:8001";
 const DATABASE_URL = process.env.DATABASE_URL;
 const REDIS_URL = process.env.REDIS_URL || "redis://redis:6379";
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production-please";
 const OFFER_TIMEOUT_SEC = Number(process.env.OFFER_TIMEOUT_SEC || 60);
+const DRIVER_RETRY_INTERVAL_SEC = Number(process.env.DRIVER_RETRY_INTERVAL_SEC || 10);
+const DRIVER_RETRY_MAX_ATTEMPTS = Number(process.env.DRIVER_RETRY_MAX_ATTEMPTS || 12);
 const PORT = Number(process.env.PORT || 8005);
 
 if (!DATABASE_URL) {
@@ -79,8 +87,47 @@ const kafka = new Kafka({ clientId: "ride-service", brokers });
 const producer = kafka.producer();
 const consumer = kafka.consumer({ groupId });
 
+/**
+ * Resolve a human-readable address from a location object.
+ * Uses existing address string if it looks like a real name;
+ * falls back to Geoapify reverse geocoding via geo-service.
+ */
+async function resolveAddress(location) {
+  if (!location?.lat || !location?.lng) return null;
+  const existing = (location.address || "").trim();
+  // If we already have a proper address (not just raw coords), keep it
+  if (existing && !existing.startsWith("Vị trí hiện tại") && existing.length > 8) {
+    return existing;
+  }
+  try {
+    const resp = await axios.get(`${GEO_BASE_URL}/geo/reverse`, {
+      params: { lat: location.lat, lng: location.lng },
+      timeout: 3000,
+    });
+    return resp.data?.formattedAddress || resp.data?.name || existing || null;
+  } catch (e) {
+    console.warn("[RIDE] geo reverse failed:", e.message);
+    // Fall back to raw address string (could be "Vị trí hiện tại (lat, lng)" — still useful)
+    return existing || `${location.lat.toFixed(5)}, ${location.lng.toFixed(5)}`;
+  }
+}
+
 /** Offer next driver based on rides.candidates + rides.candidate_index */
 /** Offer next driver based on rides.candidates + rides.candidate_index */
+
+async function fetchUserProfile(userId) {
+  try {
+    const resp = await axios.get(`${AUTH_BASE_URL}/internal/profile/user/${userId}`, { timeout: 2000 });
+    return resp.data;
+  } catch { return null; }
+}
+
+async function fetchDriverProfile(driverId) {
+  try {
+    const resp = await axios.get(`${AUTH_BASE_URL}/internal/profile/driver/${driverId}`, { timeout: 2000 });
+    return resp.data;
+  } catch { return null; }
+}
 async function offerNextDriver(rideId) {
   const client = await pool.connect();
   let lockedDriverId = null;
@@ -134,6 +181,13 @@ async function offerNextDriver(rideId) {
 
       await client.query("COMMIT");
 
+      // Resolve human-readable addresses via geo-service (before releasing client)
+      const [pickupAddress, dropoffAddress, userProfile] = await Promise.all([
+        resolveAddress(ride.pickup),
+        resolveAddress(ride.dropoff),
+        fetchUserProfile(ride.user_id),
+      ]);
+
       // Publish offer event
       const offerEvent = {
         eventId: crypto.randomUUID(),
@@ -146,6 +200,24 @@ async function offerNextDriver(rideId) {
           bookingId: ride.booking_id,
           driverId,
           expiresInSec: OFFER_TIMEOUT_SEC,
+          pickup: ride.pickup ? {
+            lat: ride.pickup.lat,
+            lng: ride.pickup.lng,
+            address: pickupAddress,
+          } : null,
+          dropoff: ride.dropoff ? {
+            lat: ride.dropoff.lat,
+            lng: ride.dropoff.lng,
+            address: dropoffAddress,
+          } : null,
+          fare: ride.fare != null ? Number(ride.fare) : null,
+          distanceM: ride.distance_m ?? null,
+          durationS: ride.duration_s ?? null,
+          currency: ride.currency || "VND",
+          userProfile: userProfile ? {
+            full_name: userProfile.full_name || null,
+            phone: userProfile.phone || null,
+          } : null,
         },
       };
 
@@ -158,13 +230,15 @@ async function offerNextDriver(rideId) {
       return;
     }
 
-    // No drivers left
-    await client.query(`UPDATE rides SET status='NO_DRIVER_FOUND', updated_at=now() WHERE id=$1`, [
-      rideId,
-    ]);
+    // No drivers found right now -- schedule retries instead of giving up immediately
+    const nextRetry = new Date(Date.now() + DRIVER_RETRY_INTERVAL_SEC * 1000).toISOString();
+    await client.query(
+      `UPDATE rides SET status='NO_DRIVER_FOUND', retry_count=0, next_retry_at=$2, updated_at=now() WHERE id=$1`,
+      [rideId, nextRetry]
+    );
     await client.query("COMMIT");
 
-    console.log(`[RIDE] NO_DRIVER_FOUND ride=${rideId}`);
+    console.log(`[RIDE] NO_DRIVER_FOUND (will retry) ride=${rideId} nextRetry=${nextRetry}`);
   } catch (e) {
     try {
       await client.query("ROLLBACK");
@@ -235,20 +309,375 @@ async function startTimeoutLoop() {
   }, 2000);
 }
 
+/** Retry loop: when no drivers found, periodically re-query nearby drivers and try offering */
+async function startRetryLoop() {
+  setInterval(async () => {
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query(
+        `SELECT id, booking_id, pickup, dropoff, retry_count
+         FROM rides
+         WHERE status='NO_DRIVER_FOUND' AND next_retry_at IS NOT NULL AND next_retry_at <= now()
+         LIMIT 20`
+      );
+
+      for (const row of rows) {
+        const rideId = row.id;
+        const bookingId = row.booking_id;
+
+        try {
+          // Re-query nearby drivers from driver-service
+          const pickup = row.pickup;
+          const resp = await axios.get(`${DRIVER_BASE_URL}/drivers/nearby`, {
+            params: {
+              lat: pickup?.lat,
+              lng: pickup?.lng,
+              radiusM: 3000,
+              vehicleType: row.vehicle_type || "CAR_4",
+              limit: 20,
+            },
+            timeout: 3000,
+          });
+
+          const drivers = resp.data?.drivers || [];
+
+          if (drivers.length > 0) {
+            // Found drivers: move back to OFFERING and set candidates
+            await client.query("BEGIN");
+            await client.query(
+              `UPDATE rides SET candidates=$2, status='OFFERING', candidate_index=0, next_retry_at=NULL, retry_count=0, updated_at=now() WHERE id=$1`,
+              [rideId, JSON.stringify(drivers)]
+            );
+            await client.query("COMMIT");
+            console.log(`[RIDE] Retry found drivers for ride=${rideId} drivers=${drivers.length} -> offering`);
+            await offerNextDriver(rideId);
+            continue;
+          }
+
+          // No drivers again: increment retry_count and schedule next
+          const nextRetry = new Date(Date.now() + DRIVER_RETRY_INTERVAL_SEC * 1000).toISOString();
+          let nextCount = (row.retry_count || 0) + 1;
+          if (nextCount >= DRIVER_RETRY_MAX_ATTEMPTS) {
+            // Give up after max attempts; keep NO_DRIVER_FOUND and clear next_retry_at
+            await client.query(
+              `UPDATE rides SET retry_count=$2, next_retry_at=NULL, updated_at=now() WHERE id=$1`,
+              [rideId, nextCount]
+            );
+            console.log(`[RIDE] Retry reached max attempts for ride=${rideId} (gave up)`);
+          } else {
+            await client.query(
+              `UPDATE rides SET retry_count=$2, next_retry_at=$3, updated_at=now() WHERE id=$1`,
+              [rideId, nextCount, nextRetry]
+            );
+            console.log(`[RIDE] Retry scheduled for ride=${rideId} nextRetry=${nextRetry} attempt=${nextCount}`);
+          }
+        } catch (e) {
+          console.error(`[RIDE] retry loop error for ride=${rideId}:`, e.message);
+        }
+      }
+    } catch (e) {
+      console.error("retry loop error:", e.message);
+    } finally {
+      client.release();
+    }
+  }, 5000); // wake every 10s to find rides to retry
+}
+
 /** Express API */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Auth middleware for driver endpoints (supports both JWT and legacy x-driver-id)
+function driverAuthMiddleware(req, res, next) {
+  try {
+    // Try JWT first
+    const authHeader = req.header("Authorization");
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const token = authHeader.substring(7);
+      const decoded = jwt.verify(token, JWT_SECRET);
+      
+      if (decoded.role !== "DRIVER") {
+        return res.status(403).json({ error: "Forbidden: DRIVER role required" });
+      }
+      
+      req.auth = {
+        accountId: decoded.sub,
+        role: decoded.role,
+        driverId: decoded.driverId,
+      };
+      return next();
+    }
+    
+    // Fallback to legacy x-driver-id
+    const legacyId = req.header("x-driver-id");
+    if (legacyId) {
+      req.auth = { driverId: legacyId, role: "DRIVER", accountId: null };
+      return next();
+    }
+    
+    return res.status(401).json({ error: "Missing authentication (Bearer token or x-driver-id)" });
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Token expired" });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+}
+
 function getDriverId(req) {
-  const id = req.header("x-driver-id");
-  if (!id) throw new Error("Missing x-driver-id header (MVP)");
-  return id;
+  if (!req.auth?.driverId) throw new Error("Missing driverId");
+  return req.auth.driverId;
+}
+
+// Auth middleware for user endpoints
+function userAuthMiddleware(req, res, next) {
+  try {
+    const authHeader = req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer "))
+      return res.status(401).json({ error: "Missing authentication" });
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.role !== "USER")
+      return res.status(403).json({ error: "Forbidden: USER role required" });
+    req.auth = { accountId: decoded.sub, role: decoded.role, userId: decoded.userId || decoded.sub };
+    return next();
+  } catch (err) {
+    if (err.name === "JsonWebTokenError") return res.status(401).json({ error: "Invalid token" });
+    if (err.name === "TokenExpiredError") return res.status(401).json({ error: "Token expired" });
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+function getUserId(req) {
+  if (!req.auth?.userId) throw new Error("Missing userId");
+  return req.auth.userId;
 }
 
 app.get("/health", async (req, res) => res.json({ ok: true }));
 
-app.post("/rides/:rideId/driver/accept", async (req, res) => {
+// Cancel active ride (user, only allowed at DRIVER_ASSIGNED stage)
+app.post("/rides/:rideId/user/cancel", userAuthMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const rideId = req.params.rideId;
+    const userId = getUserId(req);
+
+    await client.query("BEGIN");
+    const r = await client.query("SELECT * FROM rides WHERE id=$1 FOR UPDATE", [rideId]);
+    if (!r.rowCount) throw new Error("ride not found");
+    const ride = r.rows[0];
+
+    if (ride.user_id !== userId) throw new Error("not your ride");
+    if (ride.status === "CANCELLED") {
+      await client.query("COMMIT");
+      return res.json({ ok: true, alreadyCancelled: true });
+    }
+    if (![ "DRIVER_ASSIGNED", "PICKED_UP" ].includes(ride.status)) {
+      throw new Error(`Cannot cancel ride in status ${ride.status}`);
+    }
+
+    await client.query(
+      "UPDATE rides SET status='CANCELLED', updated_at=now() WHERE id=$1",
+      [rideId]
+    );
+    await client.query("COMMIT");
+
+    const driverId = ride.driver_id;
+
+    // Publish RIDE_CANCELLED event
+    await producer.send({
+      topic,
+      messages: [{
+        key: String(ride.booking_id),
+        value: JSON.stringify({
+          eventId: crypto.randomUUID(),
+          eventType: "RIDE_CANCELLED",
+          aggregateType: "RIDE",
+          aggregateId: rideId,
+          occurredAt: new Date().toISOString(),
+          payload: { rideId, bookingId: ride.booking_id, userId, driverId, reason: "user_cancelled" },
+        }),
+      }],
+    });
+
+    // Set driver back to ONLINE
+    if (driverId) {
+      try {
+        await axios.post(
+          `${DRIVER_BASE_URL}/internal/drivers/${driverId}/state`,
+          { state: "ONLINE" },
+          { timeout: 3000 }
+        );
+      } catch (e) {
+        console.error(`[RIDE] failed to set driver ${driverId} ONLINE after user cancel:`, e.message);
+      }
+      await unlockDriver(driverId);
+    }
+
+    console.log(`[RIDE] RIDE_CANCELLED by user ride=${rideId} driver=${driverId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Get current ride for user (active ride with driver assigned)
+app.get("/users/me/rides/current", async (req, res) => {
+  try {
+    // Extract userId from JWT token
+    const authHeader = req.header("Authorization");
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Missing authentication" });
+    }
+
+    const token = authHeader.substring(7);
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    if (decoded.role !== "USER") {
+      return res.status(403).json({ error: "Forbidden: USER role required" });
+    }
+
+    const userId = decoded.userId || decoded.sub;
+
+    // Get active ride for this user
+    const result = await pool.query(
+      `SELECT * FROM rides 
+       WHERE user_id = $1 
+       AND status IN ('OFFERING', 'DRIVER_ASSIGNED', 'PICKED_UP', 'ARRIVING')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.json({ type: "none", ride: null });
+    }
+
+    const ride = result.rows[0];
+
+    // Determine type based on status
+    if (ride.status === "OFFERING") {
+      return res.json({ type: "searching", ride });
+    }
+
+    if (["DRIVER_ASSIGNED", "PICKED_UP", "ARRIVING"].includes(ride.status)) {
+      return res.json({ type: "active", ride });
+    }
+
+    return res.json({ type: "none", ride: null });
+  } catch (e) {
+    if (e.name === "JsonWebTokenError" || e.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get completed ride history for driver (last 20), enriched with booking details
+app.get("/drivers/me/rides/history", driverAuthMiddleware, async (req, res) => {
+  try {
+    const driverId = getDriverId(req);
+    const limit = Math.min(Number(req.query.limit) || 20, 50);
+
+    const result = await pool.query(
+      `SELECT id, booking_id, user_id, driver_id, status, created_at, updated_at
+       FROM rides
+       WHERE driver_id = $1 AND status = 'COMPLETED'
+       ORDER BY updated_at DESC
+       LIMIT $2`,
+      [driverId, limit]
+    );
+
+    const rides = result.rows;
+    if (rides.length === 0) return res.json({ rides: [] });
+
+    // Enrich with booking info (pickup/dropoff/fare) from booking-service
+    const bookingIds = rides.map((r) => r.booking_id).filter(Boolean);
+    let bookingMap = {};
+    try {
+      const bResp = await axios.post(
+        `${BOOKING_BASE_URL}/bookings/internal/batch`,
+        { ids: bookingIds },
+        { timeout: 3000 }
+      );
+      bookingMap = bResp.data?.bookings || {};
+    } catch (e) {
+      console.error("[RIDE] batch booking enrich failed:", e.message);
+    }
+
+    const enriched = rides.map((r) => ({
+      rideId: r.id,
+      bookingId: r.booking_id,
+      userId: r.user_id,
+      status: r.status,
+      completedAt: r.updated_at || r.created_at,
+      ...(bookingMap[r.booking_id] || {}),
+    }));
+
+    res.json({ rides: enriched });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get current ride for driver (offered or active)
+app.get("/drivers/me/rides/current", driverAuthMiddleware, async (req, res) => {
+  try {
+    const driverId = getDriverId(req);
+
+    // Check for active ride (DRIVER_ASSIGNED or later)
+    const activeRide = await pool.query(
+      `SELECT * FROM rides 
+       WHERE driver_id = $1 
+       AND status IN ('DRIVER_ASSIGNED', 'PICKED_UP', 'ARRIVING')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [driverId]
+    );
+
+    if (activeRide.rowCount > 0) {
+      return res.json({
+        type: "active",
+        ride: activeRide.rows[0],
+      });
+    }
+
+    // Check for pending offer (OFFERING)
+    const offeredRide = await pool.query(
+      `SELECT * FROM rides 
+       WHERE current_offer_driver_id = $1 
+       AND status = 'OFFERING'
+       AND offer_expires_at > now()
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [driverId]
+    );
+
+    if (offeredRide.rowCount > 0) {
+      return res.json({
+        type: "offered",
+        ride: offeredRide.rows[0],
+      });
+    }
+
+    // No current ride
+    return res.json({
+      type: "none",
+      ride: null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/rides/:rideId/driver/accept", driverAuthMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     const rideId = req.params.rideId;
@@ -309,6 +738,8 @@ app.post("/rides/:rideId/driver/accept", async (req, res) => {
       console.error(`[RIDE] failed to set driver ${driverId} BUSY:`, e.response?.data || e.message);
     }
 
+    const driverProfile = await fetchDriverProfile(driverId);
+
     const acceptedEvent = {
       eventId: crypto.randomUUID(),
       eventType: "RIDE_ACCEPTED",
@@ -320,6 +751,12 @@ app.post("/rides/:rideId/driver/accept", async (req, res) => {
         bookingId: ride.booking_id,
         userId: ride.user_id,
         driverId,
+        driverProfile: driverProfile ? {
+          full_name: driverProfile.full_name || null,
+          phone: driverProfile.phone || null,
+          vehicle_type: driverProfile.vehicle_type || null,
+          license_plate: driverProfile.license_plate || null,
+        } : null,
       },
     };
 
@@ -339,7 +776,7 @@ app.post("/rides/:rideId/driver/accept", async (req, res) => {
   }
 });
 
-app.post("/rides/:rideId/driver/reject", async (req, res) => {
+app.post("/rides/:rideId/driver/reject", driverAuthMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     const rideId = req.params.rideId;
@@ -386,7 +823,59 @@ app.post("/rides/:rideId/driver/reject", async (req, res) => {
   }
 });
 
-app.post("/rides/:rideId/complete", async (req, res) => {
+// Mark passenger as picked up (DRIVER_ASSIGNED → PICKED_UP)
+app.post("/rides/:rideId/driver/pickup", driverAuthMiddleware, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const rideId = req.params.rideId;
+    const driverId = getDriverId(req);
+
+    await client.query("BEGIN");
+    const r = await client.query("SELECT * FROM rides WHERE id=$1 FOR UPDATE", [rideId]);
+    if (!r.rowCount) throw new Error("ride not found");
+    const ride = r.rows[0];
+
+    if (ride.driver_id !== driverId) throw new Error("not your ride");
+    if (ride.status === "PICKED_UP") {
+      await client.query("COMMIT");
+      return res.json({ ok: true, alreadyPickedUp: true });
+    }
+    if (ride.status !== "DRIVER_ASSIGNED") {
+      throw new Error(`Cannot mark pickup in status ${ride.status}`);
+    }
+
+    await client.query(
+      "UPDATE rides SET status='PICKED_UP', updated_at=now() WHERE id=$1",
+      [rideId]
+    );
+    await client.query("COMMIT");
+
+    await producer.send({
+      topic,
+      messages: [{
+        key: String(ride.booking_id),
+        value: JSON.stringify({
+          eventId: crypto.randomUUID(),
+          eventType: "PASSENGER_PICKED_UP",
+          aggregateType: "RIDE",
+          aggregateId: rideId,
+          occurredAt: new Date().toISOString(),
+          payload: { rideId, bookingId: ride.booking_id, userId: ride.user_id, driverId },
+        }),
+      }],
+    });
+
+    console.log(`[RIDE] PASSENGER_PICKED_UP ride=${rideId} driver=${driverId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    res.status(400).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/rides/:rideId/complete", driverAuthMiddleware, async (req, res) => {
   const client = await pool.connect();
   try {
     const rideId = req.params.rideId;
@@ -470,6 +959,8 @@ async function main() {
 
   // Start timeout loop
   startTimeoutLoop();
+  // Start retry loop for NO_DRIVER_FOUND rides
+  startRetryLoop();
 
   // Start API
   app.listen(PORT, () => console.log(`✅ Ride API listening on http://localhost:${PORT}`));
@@ -491,6 +982,52 @@ async function main() {
         return;
       }
 
+      if (evt.eventType === "BOOKING_CANCELLED") {
+        // Cancel any OFFERING ride for this booking and notify the driver currently being offered
+        try {
+          const bookingId = evt.aggregateId || evt.payload?.bookingId;
+          if (bookingId) {
+            const { rows } = await pool.query(
+              `UPDATE rides SET status='CANCELLED', updated_at=now()
+               WHERE booking_id=$1 AND status IN ('OFFERING','NO_DRIVER_FOUND')
+               RETURNING id, current_offer_driver_id`,
+              [bookingId]
+            );
+            for (const row of rows) {
+              if (row.current_offer_driver_id) {
+                // Unlock the driver
+                try { await unlockDriver(row.current_offer_driver_id); } catch {}
+                // Notify driver via SSE that the offer is cancelled
+                await producer.send({
+                  topic,
+                  messages: [{
+                    key: String(row.id),
+                    value: JSON.stringify({
+                      eventId: crypto.randomUUID(),
+                      eventType: "RIDE_OFFER_CANCELLED",
+                      aggregateType: "RIDE",
+                      aggregateId: row.id,
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        rideId: row.id,
+                        bookingId,
+                        driverId: row.current_offer_driver_id,
+                        reason: "booking_cancelled",
+                      },
+                    }),
+                  }],
+                });
+                console.log(`[RIDE] BOOKING_CANCELLED → RIDE_OFFER_CANCELLED ride=${row.id} driver=${row.current_offer_driver_id}`);
+              }
+            }
+          }
+        } catch (e) {
+          console.error("[RIDE] BOOKING_CANCELLED handler error:", e.message);
+        }
+        await markProcessed(eventId);
+        return;
+      }
+
       if (evt.eventType !== "BOOKING_MATCH_REQUESTED") {
         // MVP: ignore other event types
         await markProcessed(eventId);
@@ -500,8 +1037,13 @@ async function main() {
       // Handle BOOKING_MATCH_REQUESTED
       try {
         const bookingId = evt.aggregateId;
-        const { userId, pickup, vehicleType } = evt.payload || {};
+        const { userId, pickup, dropoff, vehicleType, pricingSnapshot } = evt.payload || {};
         if (!pickup?.lat || !pickup?.lng || !vehicleType) throw new Error("payload missing pickup/vehicleType");
+
+        const fare       = pricingSnapshot?.fare       ?? null;
+        const distanceM  = pricingSnapshot?.distanceM  ?? null;
+        const durationS  = pricingSnapshot?.durationS  ?? null;
+        const currency   = pricingSnapshot?.currency   || "VND";
 
         // Query nearby drivers
         const resp = await axios.get(`${DRIVER_BASE_URL}/drivers/nearby`, {
@@ -533,25 +1075,40 @@ async function main() {
           } else {
             rideId = crypto.randomUUID();
             await client.query(
-              `INSERT INTO rides(id, booking_id, user_id, status, candidates, candidate_index)
-               VALUES ($1,$2,$3,'OFFERING',$4,0)`,
-              [rideId, bookingId, userId || null, JSON.stringify(drivers)]
+              `INSERT INTO rides(id, booking_id, user_id, status, candidates, candidate_index, pickup, dropoff, fare, distance_m, duration_s, currency, vehicle_type)
+                VALUES ($1,$2,$3,'OFFERING',$4,0,$5,$6,$7,$8,$9,$10,$11)`,
+                [rideId, bookingId, userId || null, JSON.stringify(drivers),
+                pickup ? JSON.stringify(pickup) : null,
+                dropoff ? JSON.stringify(dropoff) : null,
+                fare, distanceM, durationS, currency, vehicleType || null]
             );
           }
 
-          // Update latest candidates for this booking
-          await client.query(`UPDATE rides SET candidates=$2, updated_at=now() WHERE id=$1`, [
-            rideId,
-            JSON.stringify(drivers),
-          ]);
+          // Update latest candidates and ensure pickup/dropoff/fare are stored
+          await client.query(
+            `UPDATE rides SET candidates=$2, updated_at=now(),
+              pickup   = COALESCE(pickup,   $3::jsonb),
+              dropoff  = COALESCE(dropoff,  $4::jsonb),
+              fare     = COALESCE(fare,     $5),
+              distance_m = COALESCE(distance_m, $6),
+              duration_s = COALESCE(duration_s, $7),
+              currency   = COALESCE(currency,   $8),
+              vehicle_type = COALESCE(vehicle_type, $9)
+             WHERE id=$1`,
+            [rideId, JSON.stringify(drivers),
+             pickup  ? JSON.stringify(pickup)  : null,
+             dropoff ? JSON.stringify(dropoff) : null,
+             fare, distanceM, durationS, currency, vehicleType || null]
+          );
 
           if (drivers.length === 0) {
+            const nextRetry = new Date(Date.now() + DRIVER_RETRY_INTERVAL_SEC * 1000).toISOString();
             await client.query(
-              `UPDATE rides SET status='NO_DRIVER_FOUND', updated_at=now() WHERE id=$1`,
-              [rideId]
+              `UPDATE rides SET status='NO_DRIVER_FOUND', retry_count=0, next_retry_at=$2, vehicle_type=$3, updated_at=now() WHERE id=$1`,
+              [rideId, nextRetry, vehicleType || null]
             );
             await client.query("COMMIT");
-            console.log(`[RIDE] NO_DRIVER_FOUND booking=${bookingId} ride=${rideId}`);
+            console.log(`[RIDE] NO_DRIVER_FOUND booking=${bookingId} ride=${rideId} (will retry ${nextRetry})`);
           } else {
             await client.query("COMMIT");
             console.log(`[RIDE] MATCH_REQUEST booking=${bookingId} ride=${rideId} drivers=${drivers.length}`);
