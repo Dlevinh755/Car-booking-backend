@@ -12,7 +12,7 @@ const kafka = new Kafka({
 });
 
 const consumer = kafka.consumer({ groupId: process.env.KAFKA_GROUP_ID || "booking-service" });
-const topic = process.env.KAFKA_TOPIC || "taxi.events";
+const topic = process.env.KAFKA_RIDE_TOPIC || "taxi.rides";
 
 await consumer.connect();
 await consumer.subscribe({ topic, fromBeginning: false });

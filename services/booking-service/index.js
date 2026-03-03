@@ -375,8 +375,9 @@ app.get("/outbox", async (req, res) => {
 });
 
 // ── Kafka setup (producer + consumer) ───────────────────────────────────────────
-const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || "kafka:9092").split(",");
-const KAFKA_TOPIC   = process.env.KAFKA_TOPIC   || "taxi.events";
+const KAFKA_BROKERS        = (process.env.KAFKA_BROKERS || "kafka:9092").split(",");
+const KAFKA_BOOKING_TOPIC  = process.env.KAFKA_BOOKING_TOPIC || "taxi.bookings";
+const KAFKA_RIDE_TOPIC     = process.env.KAFKA_RIDE_TOPIC    || "taxi.rides";
 
 const kafkaClient        = new Kafka({ clientId: "booking-service-consumer", brokers: KAFKA_BROKERS });
 const consumer           = kafkaClient.consumer({ groupId: "booking-service" });
@@ -416,7 +417,7 @@ app.post("/bookings/:id/cancel", userAuthMiddleware, async (req, res) => {
       payload: { bookingId: id, userId, reason: "user_cancelled" },
     };
     await bookingProducer.send({
-      topic: KAFKA_TOPIC,
+      topic: KAFKA_BOOKING_TOPIC,
       messages: [{ key: id, value: JSON.stringify(evt) }],
     });
 
@@ -439,8 +440,8 @@ app.listen(PORT, () => {
 // ── Kafka consumer + auto-cancel job ───────────────────────────────
 async function startKafkaConsumer() {
   await consumer.connect();
-  await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
-  console.log(`✅ booking-service consuming ${KAFKA_TOPIC}`);
+  await consumer.subscribe({ topic: KAFKA_RIDE_TOPIC, fromBeginning: false });
+  console.log(`✅ booking-service consuming ${KAFKA_RIDE_TOPIC}`);
 
   await consumer.run({
     eachMessage: async ({ message }) => {
@@ -500,7 +501,7 @@ async function startAutoCancelJob() {
             payload: { bookingId: bk.id, userId: bk.user_id, reason: "no_driver_timeout" },
           }),
         }));
-        await bookingProducer.send({ topic: KAFKA_TOPIC, messages: msgs });
+        await bookingProducer.send({ topic: KAFKA_BOOKING_TOPIC, messages: msgs });
       }
     } catch (e) {
       console.error("[BOOKING] auto-cancel job error:", e.message);

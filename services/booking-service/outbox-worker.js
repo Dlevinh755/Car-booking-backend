@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import { Pool } from "pg";
-import { createProducer, KAFKA_TOPIC } from "./kafka.js";
+import { createProducer, KAFKA_BOOKING_TOPIC } from "./kafka.js";
 
 
 dotenv.config();
@@ -65,7 +65,7 @@ async function handleEvent(evt) {
   };
 
   await producer.send({
-    topic: KAFKA_TOPIC,
+    topic: KAFKA_BOOKING_TOPIC,
     messages: [
       {
         key: message.aggregateId,              // ordering theo bookingId
