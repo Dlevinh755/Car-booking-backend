@@ -20,4 +20,4 @@ COPY . .
 EXPOSE 8002
 
 # Start
-CMD ["node", "index.js"]
+CMD ["node", "src/index.js"]
