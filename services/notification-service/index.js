@@ -19,7 +19,9 @@ const kafka = new Kafka({
   brokers: (process.env.KAFKA_BROKERS || "kafka:9092").split(","),
 });
 
-const topic = process.env.KAFKA_TOPIC || "taxi.events";
+const bookingTopic = process.env.KAFKA_BOOKING_TOPIC || "taxi.bookings";
+const rideTopic    = process.env.KAFKA_RIDE_TOPIC    || "taxi.rides";
+const paymentTopic = process.env.KAFKA_PAYMENT_TOPIC || "taxi.payments";
 const groupId = process.env.KAFKA_GROUP_ID || "notification-service";
 
 const consumer = kafka.consumer({ groupId });
@@ -209,15 +211,15 @@ function routeEvent(evt) {
 
 async function startKafka() {
   await consumer.connect();
-  await consumer.subscribe({ topic, fromBeginning: false });
-  console.log(`✅ notification-service consuming ${topic} group=${groupId}`);
+  await consumer.subscribe({ topics: [bookingTopic, rideTopic, paymentTopic], fromBeginning: false });
+  console.log(`✅ notification-service consuming topics=${[bookingTopic, rideTopic, paymentTopic].join(',')} group=${groupId}`);
 
   await consumer.run({
-    eachMessage: async ({ message }) => {
+    eachMessage: async ({ topic: msgTopic, message }) => {
       if (!message.value) return;
       try {
         const evt = JSON.parse(message.value.toString());
-        console.log(`[notif] Kafka msg: ${evt.eventType} agg=${evt.aggregateId}`);
+        console.log(`[notif] Kafka msg: ${evt.eventType} agg=${evt.aggregateId} topic=${msgTopic}`);
         routeEvent(evt);
       } catch (e) {
         console.log("notification parse error:", e.message);

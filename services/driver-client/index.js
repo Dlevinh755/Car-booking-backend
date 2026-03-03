@@ -2,7 +2,7 @@ import { Kafka } from "kafkajs";
 import axios from "axios";
 
 const brokers = (process.env.KAFKA_BROKERS || "kafka:9092").split(",");
-const topic = process.env.KAFKA_TOPIC || "taxi.events";
+const topic = process.env.KAFKA_RIDE_TOPIC || "taxi.rides";
 const groupId = process.env.KAFKA_GROUP_ID || "driver-client";
 
 const DRIVER_ID = process.env.DRIVER_ID || "d1";

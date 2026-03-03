@@ -2,7 +2,7 @@ const { Kafka } = require('kafkajs');
 const crypto = require('crypto');
 
 const brokers = (process.env.KAFKA_BROKERS || 'kafka:9092').split(',');
-const topic   = process.env.KAFKA_TOPIC   || 'taxi.events';
+const topic   = process.env.KAFKA_PAYMENT_TOPIC || 'taxi.payments';
 
 const kafka   = new Kafka({ clientId: 'payment-service', brokers });
 const producer = kafka.producer();
