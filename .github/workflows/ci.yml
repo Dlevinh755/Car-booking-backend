@@ -29,6 +29,7 @@ jobs:
           - notification-service
           - payment-service
           - pricing-service
+          - ride-service
 
     steps:
       - name: Checkout
