@@ -16,7 +16,7 @@ RUN VITE_AUTH_URL=${VITE_API_BASE_URL} \
     VITE_NOTIFICATION_URL=${VITE_API_BASE_URL} \
     VITE_GEO_URL=${VITE_API_BASE_URL} \
     VITE_PAYMENT_URL=${VITE_API_BASE_URL} \
-    npm run build
+    npx vite build
 
 # ---- Runtime stage ----
 FROM nginx:stable-alpine
