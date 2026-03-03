@@ -13,7 +13,8 @@ import jwt from "jsonwebtoken";
  * ENV required (docker-compose):
  * - DATABASE_URL=postgres://taxi:taxi_pass@postgres:5432/ride_db
  * - KAFKA_BROKERS=kafka:9092
- * - KAFKA_TOPIC=taxi.events
+ * - KAFKA_BOOKING_TOPIC=taxi.bookings
+ * - KAFKA_RIDE_TOPIC=taxi.rides
  * - KAFKA_GROUP_ID=ride-service
  * - DRIVER_BASE_URL=http://driver-service:8004
  * - REDIS_URL=redis://redis:6379
@@ -25,7 +26,8 @@ import jwt from "jsonwebtoken";
 
 
 const brokers = (process.env.KAFKA_BROKERS || "kafka:9092").split(",");
-const topic = process.env.KAFKA_TOPIC || "taxi.events";
+const bookingTopic = process.env.KAFKA_BOOKING_TOPIC || "taxi.bookings";
+const rideTopic = process.env.KAFKA_RIDE_TOPIC || "taxi.rides";
 const groupId = process.env.KAFKA_GROUP_ID || "ride-service";
 const DRIVER_BASE_URL = process.env.DRIVER_BASE_URL || "http://driver-service:8004";
 const BOOKING_BASE_URL = process.env.BOOKING_BASE_URL || "http://booking-service:8003";
@@ -222,8 +224,8 @@ async function offerNextDriver(rideId) {
       };
 
       await producer.send({
-        topic,
-        messages: [{ key: String(ride.booking_id), value: JSON.stringify(offerEvent) }],
+        topic: rideTopic,
+        messages: [{ key: String(rideId), value: JSON.stringify(offerEvent) }],
       });
 
       console.log(`[RIDE] Offered ride=${rideId} to driver=${driverId} idx=${idx}`);
@@ -490,9 +492,9 @@ app.post("/rides/:rideId/user/cancel", userAuthMiddleware, async (req, res) => {
 
     // Publish RIDE_CANCELLED event
     await producer.send({
-      topic,
+      topic: rideTopic,
       messages: [{
-        key: String(ride.booking_id),
+        key: String(rideId),
         value: JSON.stringify({
           eventId: crypto.randomUUID(),
           eventType: "RIDE_CANCELLED",
@@ -761,8 +763,8 @@ app.post("/rides/:rideId/driver/accept", driverAuthMiddleware, async (req, res) 
     };
 
     await producer.send({
-      topic,
-      messages: [{ key: String(ride.booking_id), value: JSON.stringify(acceptedEvent) }],
+      topic: rideTopic,
+      messages: [{ key: String(rideId), value: JSON.stringify(acceptedEvent) }],
     });
 
     res.json({ ok: true, rideId, status: "DRIVER_ASSIGNED" });
@@ -851,9 +853,9 @@ app.post("/rides/:rideId/driver/pickup", driverAuthMiddleware, async (req, res) 
     await client.query("COMMIT");
 
     await producer.send({
-      topic,
+      topic: rideTopic,
       messages: [{
-        key: String(ride.booking_id),
+        key: String(rideId),
         value: JSON.stringify({
           eventId: crypto.randomUUID(),
           eventType: "PASSENGER_PICKED_UP",
@@ -914,8 +916,8 @@ app.post("/rides/:rideId/complete", driverAuthMiddleware, async (req, res) => {
     };
 
     await producer.send({
-      topic,
-      messages: [{ key: String(ride.booking_id), value: JSON.stringify(doneEvent) }],
+      topic: rideTopic,
+      messages: [{ key: String(rideId), value: JSON.stringify(doneEvent) }],
     });
 
     // ✅ Release driver back to ONLINE
@@ -954,8 +956,8 @@ async function main() {
   console.log("✅ ride-service producer connected");
 
   await consumer.connect();
-  await consumer.subscribe({ topic, fromBeginning: false });
-  console.log(`✅ ride-service consuming topic=${topic}, group=${groupId}`);
+  await consumer.subscribe({ topic: bookingTopic, fromBeginning: false });
+  console.log(`✅ ride-service consuming topic=${bookingTopic}, group=${groupId}`);
 
   // Start timeout loop
   startTimeoutLoop();
@@ -999,7 +1001,7 @@ async function main() {
                 try { await unlockDriver(row.current_offer_driver_id); } catch {}
                 // Notify driver via SSE that the offer is cancelled
                 await producer.send({
-                  topic,
+                  topic: rideTopic,
                   messages: [{
                     key: String(row.id),
                     value: JSON.stringify({

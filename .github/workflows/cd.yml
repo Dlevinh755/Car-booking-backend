@@ -1,0 +1,59 @@
+name: CD - Deploy on self-hosted runner
+
+on:
+  workflow_run:
+    workflows: ["CI - Build & Push Images"]
+    branches: ["dev"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: self-hosted
+
+    steps:
+    - name: Deploy (pull & up)
+      env:
+        IMAGE_TAG: sha-${{ github.event.workflow_run.head_sha }}
+        IMAGE_REPO_RAW: ${{ github.event.workflow_run.head_repository.full_name }}
+        APP_DIR: /home/ailab/Desktop/taxi
+        COMPOSE_FILE: docker-compose.yml
+      run: |
+        set -euo pipefail
+        cd "$APP_DIR"
+
+        [ -f .env ] || touch .env
+
+        # repo name MUST be lowercase for ghcr/docker
+        IMAGE_REPO_LOWER="$(echo "${IMAGE_REPO_RAW}" | tr '[:upper:]' '[:lower:]')"
+
+        # write to .env (so compose can use it too)
+        if grep -q '^IMAGE_REPO=' .env; then
+          sed -i "s|^IMAGE_REPO=.*|IMAGE_REPO=${IMAGE_REPO_LOWER}|" .env
+        else
+          echo "IMAGE_REPO=${IMAGE_REPO_LOWER}" >> .env
+        fi
+
+        if grep -q '^IMAGE_TAG=' .env; then
+          sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" .env
+        else
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> .env
+        fi
+
+        export IMAGE_REPO="${IMAGE_REPO_LOWER}"
+
+        echo "Deploying ${IMAGE_REPO}:${IMAGE_TAG}"
+
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin || true
+
+        docker compose --env-file .env -f "$COMPOSE_FILE" pull
+        docker compose --env-file .env -f "$COMPOSE_FILE" up -d
+        docker compose --env-file .env -f "$COMPOSE_FILE" ps

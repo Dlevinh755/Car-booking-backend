@@ -144,10 +144,12 @@ Write-Host "`n[7] Checking Kafka topics..." -ForegroundColor Yellow
 
 try {
     $topics = docker exec -i taxi_kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list 2>&1
-    if ($topics -match "taxi.events") {
-        Write-Host "  OK - taxi.events topic exists" -ForegroundColor Green
-    } else {
-        Write-Host "  WARNING - taxi.events topic not found" -ForegroundColor Yellow
+    foreach ($t in @("taxi.bookings", "taxi.rides", "taxi.payments")) {
+        if ($topics -match [regex]::Escape($t)) {
+            Write-Host "  OK - $t topic exists" -ForegroundColor Green
+        } else {
+            Write-Host "  WARNING - $t topic not found" -ForegroundColor Yellow
+        }
     }
 } catch {
     Write-Host "  WARNING - Cannot check Kafka topics" -ForegroundColor Yellow

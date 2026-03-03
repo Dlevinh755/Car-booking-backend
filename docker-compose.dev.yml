@@ -24,7 +24,8 @@ services:
       PORT: 8003
       DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/taxi_main
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_BOOKING_TOPIC: taxi.bookings
+      KAFKA_RIDE_TOPIC: taxi.rides
       JWT_SECRET: dev-secret-change-in-production-please
       TZ: Asia/Ho_Chi_Minh
     ports:
@@ -52,7 +53,8 @@ services:
       OUTBOX_BATCH_SIZE: 20
       TZ: Asia/Ho_Chi_Minh
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_BOOKING_TOPIC: taxi.bookings
+      KAFKA_RIDE_TOPIC: taxi.rides
     volumes:
       - ./services/booking-service:/app
       - booking_node_modules:/app/node_modules
@@ -126,7 +128,6 @@ services:
       retries: 5
     networks:
       - taxi_net
-
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: taxi_pgadmin
@@ -147,7 +148,6 @@ services:
         condition: service_healthy
     networks:
       - taxi_net
-
   kafka:
     image: apache/kafka:4.1.1
     container_name: taxi_kafka
@@ -180,7 +180,6 @@ services:
       start_period: 20s
     networks:
       - taxi_net
-
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: taxi_kafka_ui
@@ -194,7 +193,6 @@ services:
       - kafka
     networks:
       - taxi_net
-
   kafka-init:
     image: apache/kafka:4.1.1
     container_name: taxi_kafka_init
@@ -203,14 +201,11 @@ services:
       - |
         echo "Waiting for Kafka to be ready..."
         sleep 10
-        echo "Creating taxi.events topic..."
-        /opt/kafka/bin/kafka-topics.sh --create \
-          --bootstrap-server kafka:9092 \
-          --topic taxi.events \
-          --partitions 3 \
-          --replication-factor 1 \
-          --if-not-exists
-        echo "Topic created successfully!"
+        echo "Creating Kafka topics..."
+        /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server kafka:9092 --topic taxi.bookings --partitions 3 --replication-factor 1 --if-not-exists
+        /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server kafka:9092 --topic taxi.rides --partitions 3 --replication-factor 1 --if-not-exists
+        /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server kafka:9092 --topic taxi.payments --partitions 2 --replication-factor 1 --if-not-exists
+        echo "Topics created successfully!"
         /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server kafka:9092
     depends_on:
       kafka:
@@ -218,7 +213,6 @@ services:
     networks:
       - taxi_net
     restart: "no"
-
   ride-service:
     image: node:20-alpine
     container_name: taxi_ride_dev
@@ -228,7 +222,8 @@ services:
     environment:
       PORT: 8005
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_BOOKING_TOPIC: taxi.bookings
+      KAFKA_RIDE_TOPIC: taxi.rides
       KAFKA_GROUP_ID: ride-service
       TZ: Asia/Ho_Chi_Minh
       DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/ride_db
@@ -277,7 +272,7 @@ services:
     environment:
       DATABASE_URL: postgres://taxi:taxi_pass@postgres:5432/taxi_main
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_RIDE_TOPIC: taxi.rides
       KAFKA_GROUP_ID: booking-service
     volumes:
       - ./services/booking-service:/app
@@ -298,7 +293,7 @@ services:
     working_dir: /app
     environment:
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_RIDE_TOPIC: taxi.rides
       KAFKA_GROUP_ID: driver-client
       DRIVER_ID: d1
       RIDE_BASE_URL: http://ride-service:8005
@@ -320,7 +315,9 @@ services:
     environment:
       PORT: 8006
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_BOOKING_TOPIC: taxi.bookings
+      KAFKA_RIDE_TOPIC: taxi.rides
+      KAFKA_PAYMENT_TOPIC: taxi.payments
       KAFKA_GROUP_ID: notification-service
       JWT_SECRET: dev-secret-change-in-production-please
       TZ: Asia/Ho_Chi_Minh
@@ -362,7 +359,7 @@ services:
       NODE_ENV: development
       TZ: Asia/Ho_Chi_Minh
       KAFKA_BROKERS: kafka:9092
-      KAFKA_TOPIC: taxi.events
+      KAFKA_PAYMENT_TOPIC: taxi.payments
     ports:
       - "8888:8888"
     volumes:
