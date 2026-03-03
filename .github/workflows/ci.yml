@@ -30,6 +30,7 @@ jobs:
           - payment-service
           - pricing-service
           - ride-service
+          - taxi-fe
 
     steps:
       - name: Checkout
@@ -70,8 +71,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build & Push (taxi-fe)
+        if: matrix.service == 'taxi-fe'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./taxi-fe
+          file: ./taxi-fe/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Build & Push (others)
-        if: matrix.service != 'api-gateway'
+        if: matrix.service != 'api-gateway' && matrix.service != 'taxi-fe'
         uses: docker/build-push-action@v6
         with:
           context: ./services/${{ matrix.service }}
